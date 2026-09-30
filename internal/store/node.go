@@ -2,6 +2,8 @@ package store
 
 import (
 	"encoding/json"
+	"hash/fnv"
+	mathrand "math/rand"
 	"os"
 	"path/filepath"
 	"sync"
@@ -147,6 +149,8 @@ type Node struct {
 	lastHeartbeat time.Time
 	down         bool
 	stopped      bool
+	rng          *mathrand.Rand
+	stopCh       chan struct{}
 
 	// 仅 leader 使用
 	nextIndex  map[string]int64
@@ -160,6 +164,9 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	if lg == nil {
 		lg = discardLogger{}
 	}
+	h := fnv.New64a()
+	h.Write([]byte(cfg.ID))
+	seed := int64(h.Sum64()) ^ time.Now().UnixNano()
 	n := &Node{
 		cfg:        cfg,
 		log:        lg,
@@ -167,6 +174,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		nextIndex:  make(map[string]int64),
 		matchIndex: make(map[string]int64),
 		pending:    make(map[int64]*proposal),
+		rng:        mathrand.New(mathrand.NewSource(seed)),
 	}
 	logPath := ""
 	if cfg.DataDir != "" {
@@ -288,7 +296,7 @@ func (n *Node) resetElectionDeadlineLocked(now time.Time) {
 	span := int64(hi - lo)
 	d := lo
 	if span > 0 {
-		d += time.Duration((now.UnixNano() + int64(n.currentTerm)*1000003) % span)
+		d += time.Duration(n.rng.Int63n(span))
 	}
 	n.electionDead = now.Add(d)
 }
@@ -457,17 +465,19 @@ func (n *Node) applyCommittedLocked() {
 	if n.commitIndex <= n.lastApplied {
 		return
 	}
-	entries := n.dlog.Entries(n.lastApplied+1, n.commitIndex)
+	entries := n.dlog.Entries(n.lastApplied+1, n.commitIndex+1) // 半开上界 +1
 	for _, e := range entries {
 		res := n.sm.Apply(e)
 		n.lastApplied = e.Index
 		if p, ok := n.pending[e.Index]; ok {
 			delete(n.pending, e.Index)
+			out := proposalResult{version: res.Version}
 			if !res.OK {
-				p.notifyCh <- proposalResult{version: res.Version,
-					err: newError(res.Code, "write rejected at apply for request "+e.RequestID)}
-			} else {
-				p.notifyCh <- proposalResult{version: res.Version}
+				out.err = newError(res.Code, "write rejected at apply for request "+e.RequestID)
+			}
+			select {
+			case p.notifyCh <- out:
+			default: // buffered channel 已有结果或接收方已放弃，绝不阻塞提交路径
 			}
 		}
 	}
@@ -621,7 +631,8 @@ func (n *Node) replicateAll() int {
 			}
 		}
 		_, last := n.dlog.Last()
-		entries := n.dlog.Entries(ni, last)
+		// 半开区间 [ni, last+1)，Entries 内部会把上界夹到日志末尾
+		entries := n.dlog.Entries(ni, last+1)
 		jobs = append(jobs, job{p, prevIndex, prevTerm, entries, n.commitIndex, term})
 	}
 	n.lastHeartbeat = time.Now()
@@ -650,11 +661,17 @@ func (n *Node) replicateAll() int {
 			continue
 		}
 		if resp.Success {
-			matched := j.prevIndex + int64(len(j.entries))
-			if matched > n.matchIndex[j.peer] {
-				n.matchIndex[j.peer] = matched
+			if len(j.entries) > 0 {
+				// 只有实际携带了日志时才推进 follower 的进度视图；
+				// 空心跳成功不得把 nextIndex/matchIndex 压回到 prevIndex。
+				matched := j.prevIndex + int64(len(j.entries))
+				if matched > n.matchIndex[j.peer] {
+					n.matchIndex[j.peer] = matched
+				}
+				if matched+1 > n.nextIndex[j.peer] {
+					n.nextIndex[j.peer] = matched + 1
+				}
 			}
-			n.nextIndex[j.peer] = matched + 1
 			acks++
 		} else {
 			cf := resp.ConflictIndex
@@ -785,52 +802,42 @@ func (n *Node) Submit(requestID string, op Op, key string, value []byte, expecte
 	// 立即推动复制，而不是等下一次心跳，以降低写入延迟。
 	n.replicateAll()
 
-	// 复制有同步往返延迟，轮询等待该条目被提交并应用。
-	deadline := time.Now().Add(submitTimeout)
+	// 等待该条目被多数派提交并应用；applyCommittedLocked 会在提交时向 notifyCh 投递结果。
+	// 同时周期性重发复制并检查领导权/多数派，以便主切换或分区时能尽快给出可区分结论。
+	deadline := time.NewTimer(submitTimeout)
+	defer deadline.Stop()
+	tick := time.NewTicker(pollInterval)
+	defer tick.Stop()
 	for {
-		n.mu.Lock()
-		// 已应用（幂等结果或本轮提交）。
-		if requestID != "" {
-			if r, ok := n.sm.Result(requestID); ok {
+		select {
+		case res := <-ch:
+			if res.err != nil {
+				return res.version, res.err
+			}
+			return res.version, nil
+		case <-tick.C:
+			n.mu.Lock()
+			if n.down {
 				n.mu.Unlock()
-				if r.OK {
-					return r.Version, nil
-				}
-				return r.Version, newError(r.Code,
-					"write rejected at apply for request "+requestID)
+				return 0, newError(CodeUnavailable, "leader "+n.cfg.ID+" crashed during submit")
 			}
-		} else {
-			if n.lastApplied >= entry.Index {
-				if r, ok := n.dlog.EntryAt(entry.Index); ok {
-					_ = r
-					n.mu.Unlock()
-					return entry.Index, nil
-				}
+			if n.role != Leader || n.currentTerm != term {
+				n.mu.Unlock()
+				return 0, newError(CodeNoShardLeader,
+					"lost leadership in term "+itoa64(term)+" while awaiting commit; retry with new leader")
 			}
-		}
-		if n.down {
+			reachable = n.countReachablePeersLocked() + 1
 			n.mu.Unlock()
-			return 0, newError(CodeUnavailable, "leader "+n.cfg.ID+" crashed during submit")
-		}
-		if n.role != Leader || n.currentTerm != term {
-			// 落选：可能已在旧任期复制到多数派（新任期会安全提交），也可能没成。
-			n.mu.Unlock()
-			return 0, newError(CodeNoShardLeader,
-				"lost leadership in term "+itoa64(term)+" while awaiting commit; retry with new leader")
-		}
-		reachable = n.countReachablePeersLocked() + 1
-		n.mu.Unlock()
-		if reachable < need {
-			return 0, newError(CodeNoQuorum,
-				"write cannot reach quorum while awaiting commit: reachable "+
-					itoa(reachable)+" < majority "+itoa(need))
-		}
-		if time.Now().After(deadline) {
+			if reachable < need {
+				return 0, newError(CodeNoQuorum,
+					"write cannot reach quorum while awaiting commit: reachable "+
+						itoa(reachable)+" < majority "+itoa(need))
+			}
+			n.replicateAll()
+		case <-deadline.C:
 			return 0, newError(CodeNoQuorum,
 				"write timed out awaiting quorum commit (majority "+itoa(need)+")")
 		}
-		n.replicateAll()
-		time.Sleep(pollInterval)
 	}
 }
 
@@ -886,6 +893,10 @@ func (n *Node) LeaderRead(key string) (KVItem, error) {
 func (n *Node) Start(tick time.Duration) {
 	n.mu.Lock()
 	n.stopped = false
+	if n.stopCh == nil {
+		n.stopCh = make(chan struct{})
+	}
+	ch := n.stopCh
 	n.mu.Unlock()
 	if tick <= 0 {
 		tick = 20 * time.Millisecond
@@ -893,14 +904,13 @@ func (n *Node) Start(tick time.Duration) {
 	go func() {
 		t := time.NewTicker(tick)
 		defer t.Stop()
-		for now := range t.C {
-			n.mu.Lock()
-			stopped := n.stopped
-			n.mu.Unlock()
-			if stopped {
+		for {
+			select {
+			case <-ch:
 				return
+			case now := <-t.C:
+				n.RaftTick(now)
 			}
-			n.RaftTick(now)
 		}
 	}()
 }
@@ -908,7 +918,17 @@ func (n *Node) Start(tick time.Duration) {
 // Shutdown 停止节点驱动（不删除持久日志，不影响崩溃恢复语义）。
 func (n *Node) Shutdown() {
 	n.mu.Lock()
+	if n.stopped {
+		n.mu.Unlock()
+		return
+	}
 	n.stopped = true
+	ch := n.stopCh
 	n.mu.Unlock()
+	if ch != nil {
+		close(ch)
+		n.stopCh = nil
+	}
 	_ = n.dlog.Close()
 }
+

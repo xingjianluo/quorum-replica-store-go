@@ -89,7 +89,8 @@ func NewDurableLog(path string) (*DurableLog, error) {
 	return l, nil
 }
 
-// Entries 返回 [from, to) 的日志条目副本；to<=0 表示到末尾。越界自动收敛。
+// Entries 返回半开逻辑区间 [from, to) 的日志条目（下标从 1 开始）。
+// to<=0 表示取到末尾；超出末尾的 to 自动夹到最后一条之后；from 越过 to 返回 nil。
 func (l *DurableLog) Entries(from, to int64) []Entry {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -97,14 +98,14 @@ func (l *DurableLog) Entries(from, to int64) []Entry {
 	if from < 1 {
 		from = 1
 	}
-	if to <= 0 || to > n {
-		to = n
+	if to <= 0 || to > n+1 {
+		to = n + 1 // 切片半开上界：n+1 表示包含最后一条
 	}
-	if from > to {
+	if from > to-1 { // to-1 是实际取到的最后一条逻辑下标
 		return nil
 	}
 	out := make([]Entry, to-from)
-	copy(out, l.entries[from-1:to])
+	copy(out, l.entries[from-1:to-1])
 	return out
 }
 
