@@ -1,13 +1,13 @@
 package store
 
 import (
+	crand "crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"hash/fnv"
-	mathrand "math/rand"
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -142,8 +142,10 @@ type Node struct {
 	currentTerm int64
 	votedFor    string
 	statePath   string
-	prePromised string // 最近一次同意预投票的候选者（内存即可，崩溃重置无碍活性）
+	prePromised    string // 最近一次同意预投票的候选者（内存即可，崩溃重置无碍活性）
 	prePromiseTerm int64
+	preStance      string // 本节点在当前预任期已站队的候选者（自己发起或已同意），用于拒绝同任期第二候选者
+	preStanceTerm  int64
 
 	// 易失状态
 	role         Role
@@ -154,24 +156,13 @@ type Node struct {
 	lastHeartbeat time.Time
 	down         bool
 	stopped      bool
-	rng          *mathrand.Rand
 	stopCh       chan struct{}
+	bootOffset   time.Duration
 
 	// 仅 leader 使用
 	nextIndex  map[string]int64
 	matchIndex map[string]int64
 	pending    map[int64]*proposal // logIndex -> 等待确认的提案
-}
-
-// nodeRandCounter 为每个新节点提供单调熵，避免同批构造时时间熵相同。
-var nodeRandCounter atomic.Int64
-
-// newNodeRand 为节点构造一个身份/时刻/全局计数混合熵的独立随机源。
-func newNodeRand(id string) *mathrand.Rand {
-	h := fnv.New64a()
-	h.Write([]byte(id))
-	seed := int64(h.Sum64()) ^ time.Now().UnixNano() ^ nodeRandCounter.Add(1)*2654435761
-	return mathrand.New(mathrand.NewSource(seed))
 }
 
 // NewNode 构造一个副本并加载本地持久日志与已投过票的任期。
@@ -180,7 +171,6 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	if lg == nil {
 		lg = discardLogger{}
 	}
-	rng := newNodeRand(cfg.ID)
 	n := &Node{
 		cfg:        cfg,
 		log:        lg,
@@ -188,7 +178,6 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		nextIndex:  make(map[string]int64),
 		matchIndex: make(map[string]int64),
 		pending:    make(map[int64]*proposal),
-		rng:        rng,
 	}
 	logPath := ""
 	if cfg.DataDir != "" {
@@ -206,9 +195,16 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	n.dlog = dl
 	n.sm = NewStateMachine()
 
-	// 恢复持久任期与投票，防止旧主重启后用旧任期重新当选（旧主不得覆盖新主已提交数据）。
+	// 恢复持久任期：持久的 currentTerm 足以防止旧主用旧任期当选（它在首次 RPC
+	// 见到更高任期后必然回退，因此不会覆盖新主已提交数据）。
 	if err := n.loadPersistedState(); err != nil {
 		return nil, err
+	}
+	// 全新进程启动时清空上一进程留下的投票意向：该票随旧进程死亡而失效，
+	// 保留它只会在"全体同时重启"时平白锁住第一轮选举（活性），不影响安全性。
+	if n.votedFor != "" {
+		n.votedFor = ""
+		_ = n.persistStateLocked()
 	}
 
 	// 重放日志重建已应用状态与幂等结果表（半开区间上界需 +1，含最后一条）。
@@ -218,7 +214,10 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	}
 	n.lastApplied = last
 	n.commitIndex = last // 保守恢复：重启后等待 leader 的 commit 确认再推进
-	n.resetElectionDeadlineLocked(time.Now())
+	// 首次截止时间额外叠加一个身份绑定的启动相位：同批构造/全体同时重启时，
+	// 让各节点首次选举尝试天然错峰，避免在同一 tick 集体超时瓜分选票。
+	n.bootOffset = n.bootPhase()
+	n.resetElectionDeadlineLockedWith(time.Now(), n.bootOffset)
 	return n, nil
 }
 
@@ -297,17 +296,44 @@ func (n *Node) Term() int64 {
 	return n.currentTerm
 }
 
-// resetElectionDeadlineLocked 安排下一次随机选举超时（调用方持锁）。
-func (n *Node) resetElectionDeadlineLocked(now time.Time) {
+// cryptoJitter 返回 [0, span) 的加密级随机时长，多个节点由此得到统计独立的抖动。
+func cryptoJitter(span time.Duration) time.Duration {
+	var b [8]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		// crypto/rand 失败在现代平台几乎不可能；退化为时间熵。
+		return time.Duration(time.Now().UnixNano() % int64(span))
+	}
+	v := binary.LittleEndian.Uint64(b[:])
+	return time.Duration(v % uint64(span))
+}
+
+// bootPhase 返回身份绑定的启动相位偏移，用于错开同批节点的首次选举尝试。
+func (n *Node) bootPhase() time.Duration {
 	base := n.cfg.ElectionTimeoutMin
 	if base <= 0 {
 		base = 200 * time.Millisecond
 	}
-	// 教科书式随机选举超时：在 [base, 3*base) 内均匀随机。
-	// 宽区间 + 高频真实时刻熵，使多节点持续同拍超时的概率随轮次指数衰减。
-	n.rng.Seed(n.rng.Int63() ^ now.UnixNano() ^ nodeRandCounter.Load()*7919)
-	span := int64(2 * base)
-	d := base + time.Duration(n.rng.Int63n(span+1))
+	h := fnv.New64a()
+	h.Write([]byte(n.cfg.ID + "|boot"))
+	return time.Duration(h.Sum64() % uint64(base))
+}
+
+// resetElectionDeadlineLocked 安排下一次随机选举超时（调用方持锁）。
+func (n *Node) resetElectionDeadlineLocked(now time.Time) {
+	n.resetElectionDeadlineLockedWith(now, 0)
+}
+
+// resetElectionDeadlineLockedWith 在标准随机超时之上再叠加一个额外相位。
+// 启动时用身份绑定相位，避免同批节点首次选举同相；运行期相位为 0。
+func (n *Node) resetElectionDeadlineLockedWith(now time.Time, extra time.Duration) {
+	base := n.cfg.ElectionTimeoutMin
+	if base <= 0 {
+		base = 200 * time.Millisecond
+	}
+	// 教科书式随机选举超时：在 [base, 3*base) 内用加密随机源均匀抖动，
+	// 节点间统计独立，多节点持续同拍超时的概率随轮次指数衰减。
+	span := 2 * base
+	d := base + cryptoJitter(span) + extra
 	n.electionDead = now.Add(d)
 }
 
@@ -349,6 +375,13 @@ func (n *Node) HandleRequestVote(req VoteRequest) VoteResponse {
 			return VoteResponse{Term: n.currentTerm, Granted: false,
 				Reason: "reject prevote: stale pre-term " + itoa64(req.Term)}
 		}
+		// 同一预任期只支持一个候选者：若我已在该预任期发起自己的选举或同意了他人，
+		// 则拒绝后来者，从根本上避免两个节点在同一预任期各自拿到多数预投票而互相锁死。
+		if n.preStanceTerm == req.Term && n.preStance != "" && n.preStance != req.Candidate {
+			return VoteResponse{Term: n.currentTerm, Granted: false,
+				Reason: "reject prevote: already backing " + n.preStance +
+					" in pre-term " + itoa64(req.Term)}
+		}
 		// 若我们近期仍能听到现任主的心跳，则不该参与推翻它的预投票。
 		// （本实现中选举超时触发即说明已听不到主，故这里仅做日志新鲜度判断。）
 		if !n.isLogUpToDateLocked(req.LastLogTerm, req.LastLogIndex) {
@@ -357,9 +390,13 @@ func (n *Node) HandleRequestVote(req VoteRequest) VoteResponse {
 					itoa64(req.LastLogTerm) + "/i" + itoa64(req.LastLogIndex) +
 					" vs t" + itoa64(lastTermP) + "/i" + itoa64(lastIndexP) + ")"}
 		}
-		// 同意预投票：记录承诺（供正式投票的安全改票判断）。
+		// 同意预投票：记录承诺与站队，并把自己的选举时钟推迟，
+		// 在本预任期内不再抢跑，把先发优势让给该候选者。
 		n.prePromised = req.Candidate
 		n.prePromiseTerm = req.Term
+		n.preStance = req.Candidate
+		n.preStanceTerm = req.Term
+		n.resetElectionDeadlineLocked(time.Now())
 		return VoteResponse{Term: n.currentTerm, Granted: true,
 			Reason: "pre-vote granted: candidate log up-to-date"}
 	}
@@ -579,13 +616,22 @@ func (n *Node) startElection() {
 		n.mu.Unlock()
 		return
 	}
-	lastTerm, lastIndex := n.dlog.Last()
 	preTerm := n.currentTerm + 1
+	// 我已在当前预任期承诺了别的候选者：不抢跑，等其正式选举或下一个预任期。
+	if n.preStanceTerm == preTerm && n.preStance != "" && n.preStance != n.cfg.ID {
+		n.resetElectionDeadlineLocked(time.Now())
+		n.mu.Unlock()
+		return
+	}
+	lastTerm, lastIndex := n.dlog.Last()
 	peers := append([]string(nil), n.cfg.Peers...)
 	n.resetElectionDeadlineLocked(time.Now())
 	n.mu.Unlock()
 
 	// ---- 预投票阶段：不改变任何持久状态 ----
+	// 标记本节点在该预任期站队自己，随后拒绝同预任期的其他拉票。
+	n.preStance = n.cfg.ID
+	n.preStanceTerm = preTerm
 	preReq := VoteRequest{ShardID: n.cfg.ShardID, Term: preTerm, Candidate: n.cfg.ID,
 		LastLogIndex: lastIndex, LastLogTerm: lastTerm, PreVote: true}
 	preVotes := 1
@@ -981,7 +1027,7 @@ func (n *Node) Start(tick time.Duration) {
 	ch := n.stopCh
 	n.mu.Unlock()
 	if tick <= 0 {
-		tick = 20 * time.Millisecond
+		tick = 5 * time.Millisecond
 	}
 	go func() {
 		t := time.NewTicker(tick)

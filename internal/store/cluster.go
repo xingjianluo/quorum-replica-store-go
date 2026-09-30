@@ -9,7 +9,7 @@ import (
 const (
 	defaultElectionMin = 200 * time.Millisecond
 	defaultElectionMax = 600 * time.Millisecond
-	defaultTick        = 20 * time.Millisecond
+	defaultTick        = 5 * time.Millisecond
 )
 
 // WriteRequest 是客户端写请求；RequestID 非空时启用幂等去重。

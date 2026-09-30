@@ -82,7 +82,7 @@ func (c *Client) submitWithRetry(ctx context.Context, req WriteRequest) (WriteRe
 		if !retryableCodes[ErrorCode(err)] {
 			return WriteResponse{}, err // 路由错误/CAS 冲突等：重试无意义，原样抛出
 		}
-		if attempt >= 50 { // 约 1s 重试窗口，上限后如实把可区分原因交给调用方
+		if attempt >= 200 { // 约 8s 重试窗口，覆盖多轮选举；上限后如实把可区分原因交给调用方
 			return WriteResponse{}, err
 		}
 		select {
@@ -110,7 +110,7 @@ func (c *Client) Get(ctx context.Context, shardID int, key string, mode ReadMode
 		if mode == ReadEventual || !retryableCodes[ErrorCode(err)] {
 			return ReadResponse{}, err
 		}
-		if attempt >= 50 {
+		if attempt >= 200 {
 			return ReadResponse{}, err
 		}
 		select {
