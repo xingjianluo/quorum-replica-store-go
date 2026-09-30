@@ -137,27 +137,27 @@ type Node struct {
 	mu     sync.Mutex
 	replMu sync.Mutex
 	// 持久状态（崩溃后必须恢复）
-	dlog        *DurableLog
-	sm          *StateMachine
-	currentTerm int64
-	votedFor    string
-	statePath   string
+	dlog           *DurableLog
+	sm             *StateMachine
+	currentTerm    int64
+	votedFor       string
+	statePath      string
 	prePromised    string // 最近一次同意预投票的候选者（内存即可，崩溃重置无碍活性）
 	prePromiseTerm int64
 	preStance      string // 本节点在当前预任期已站队的候选者（自己发起或已同意），用于拒绝同任期第二候选者
 	preStanceTerm  int64
 
 	// 易失状态
-	role         Role
-	leader       string
-	commitIndex  int64
-	lastApplied  int64
-	electionDead time.Time
+	role          Role
+	leader        string
+	commitIndex   int64
+	lastApplied   int64
+	electionDead  time.Time
 	lastHeartbeat time.Time
-	down         bool
-	stopped      bool
-	stopCh       chan struct{}
-	bootOffset   time.Duration
+	down          bool
+	stopped       bool
+	stopCh        chan struct{}
+	bootOffset    time.Duration
 
 	// 仅 leader 使用
 	nextIndex  map[string]int64
@@ -723,7 +723,6 @@ func (n *Node) startElection() {
 	}
 }
 
-
 // replicateMu 串行化复制轮次（心跳与提交触发可能来自不同 goroutine）。
 // replicateAll 发送一轮 AppendEntries（也是主的心跳），处理冲突回退，
 // 按多数派 matchIndex 推进 commitIndex，并返回同任期成功确认的副本数（含自己）。
@@ -1059,7 +1058,6 @@ func (n *Node) Shutdown() {
 	}
 	_ = n.dlog.Close()
 }
-
 
 func boolStr(b bool) string {
 	if b {

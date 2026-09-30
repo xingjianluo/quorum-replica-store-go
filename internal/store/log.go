@@ -20,14 +20,14 @@ const (
 // Term/Index 是 Raft 风格的任期与日志位置；RequestID 携带客户端请求标识，
 // 状态机在 Apply 时据此保证同一请求只生效一次。
 type Entry struct {
-	Term      int64  `json:"term"`
-	Index     int64  `json:"index"`
-	Op        Op     `json:"op"`
-	Key       string `json:"key"`
-	Value     []byte `json:"value,omitempty"`
-	Version   int64  `json:"version"`
-	ExpectedVersion int64 `json:"expected_version"`
-	RequestID string `json:"request_id,omitempty"`
+	Term            int64  `json:"term"`
+	Index           int64  `json:"index"`
+	Op              Op     `json:"op"`
+	Key             string `json:"key"`
+	Value           []byte `json:"value,omitempty"`
+	Version         int64  `json:"version"`
+	ExpectedVersion int64  `json:"expected_version"`
+	RequestID       string `json:"request_id,omitempty"`
 }
 
 // KVItem 是某个键在状态机中的当前快照。
@@ -224,7 +224,6 @@ func (l *DurableLog) Close() error {
 	defer l.mu.Unlock()
 	return nil
 }
-
 
 func itoa64(i int64) string {
 	if i == 0 {

@@ -20,10 +20,10 @@ const (
 // retryableCodes 是客户端会自动重试的"瞬时"原因：
 // 主切换、选举中、暂时凑不齐多数派（注意：若多数派永久丢失，重试到上限后仍会如实失败）。
 var retryableCodes = map[string]bool{
-	CodeNotLeader:       true,
-	CodeNoShardLeader:   true,
-	CodeNoQuorum:        true,
-	CodeUnavailable:     true,
+	CodeNotLeader:        true,
+	CodeNoShardLeader:    true,
+	CodeNoQuorum:         true,
+	CodeUnavailable:      true,
 	CodeReadModeConflict: true,
 }
 

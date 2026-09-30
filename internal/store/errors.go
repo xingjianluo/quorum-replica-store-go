@@ -10,16 +10,16 @@ import (
 
 // 失败原因码：调用方可据此区分不同拒绝场景，禁止把这些错误合并成同一个原因。
 const (
-	CodeKeyOutOfRange      = "KeyOutOfRange"      // 键不属于任何已配置分片
-	CodeNoShardLeader      = "NoShardLeader"      // 该分片当前没有已确认的主
-	CodeNotLeader          = "NotLeader"          // 请求打到了非主副本
-	CodeNoQuorum           = "NoQuorum"           // 存活/可达副本凑不出多数派
+	CodeKeyOutOfRange       = "KeyOutOfRange"       // 键不属于任何已配置分片
+	CodeNoShardLeader       = "NoShardLeader"       // 该分片当前没有已确认的主
+	CodeNotLeader           = "NotLeader"           // 请求打到了非主副本
+	CodeNoQuorum            = "NoQuorum"            // 存活/可达副本凑不出多数派
 	CodeReplicasUnavailable = "ReplicasUnavailable" // 读要求的可达副本数不足
-	CodeReadModeConflict   = "ReadModeConflict"   // 读语义与当前节点状态冲突（如旧主/未提交状态下做强一致读）
-	CodeCasConflict        = "CasConflict"        // 版本冲突：expectedVersion 与当前版本不一致
-	CodeKeyNotFound        = "KeyNotFound"        // 键不存在
-	CodeShardUnavailable   = "ShardUnavailable"   // 分片因多数派丢失而不可写
-	CodeUnavailable        = "Unavailable"        // 集群/节点当前不可用（崩溃、全隔离等）
+	CodeReadModeConflict    = "ReadModeConflict"    // 读语义与当前节点状态冲突（如旧主/未提交状态下做强一致读）
+	CodeCasConflict         = "CasConflict"         // 版本冲突：expectedVersion 与当前版本不一致
+	CodeKeyNotFound         = "KeyNotFound"         // 键不存在
+	CodeShardUnavailable    = "ShardUnavailable"    // 分片因多数派丢失而不可写
+	CodeUnavailable         = "Unavailable"         // 集群/节点当前不可用（崩溃、全隔离等）
 )
 
 // StoreError 携带可区分的失败原因码、发生位置与判定依据说明。
