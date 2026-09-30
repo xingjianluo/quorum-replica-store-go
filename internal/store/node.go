@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -53,6 +54,7 @@ type VoteRequest struct {
 	Candidate    string
 	LastLogIndex int64
 	LastLogTerm  int64
+	PreVote      bool // 预投票：不改变任期与 votedFor，仅探测能否形成多数派
 }
 
 // VoteResponse 携带投票结果与拒绝依据（Reason 用于日志可解释性）。
@@ -110,8 +112,9 @@ type NodeState struct {
 }
 
 const (
-	submitTimeout = 3 * time.Second
-	pollInterval  = 5 * time.Millisecond
+	submitTimeout     = 3 * time.Second
+	pollInterval      = 5 * time.Millisecond
+	heartbeatInterval = 50 * time.Millisecond
 )
 
 // proposal 是主副本上等待多数派确认的一个写提案。
@@ -139,6 +142,8 @@ type Node struct {
 	currentTerm int64
 	votedFor    string
 	statePath   string
+	prePromised string // 最近一次同意预投票的候选者（内存即可，崩溃重置无碍活性）
+	prePromiseTerm int64
 
 	// 易失状态
 	role         Role
@@ -158,15 +163,24 @@ type Node struct {
 	pending    map[int64]*proposal // logIndex -> 等待确认的提案
 }
 
+// nodeRandCounter 为每个新节点提供单调熵，避免同批构造时时间熵相同。
+var nodeRandCounter atomic.Int64
+
+// newNodeRand 为节点构造一个身份/时刻/全局计数混合熵的独立随机源。
+func newNodeRand(id string) *mathrand.Rand {
+	h := fnv.New64a()
+	h.Write([]byte(id))
+	seed := int64(h.Sum64()) ^ time.Now().UnixNano() ^ nodeRandCounter.Add(1)*2654435761
+	return mathrand.New(mathrand.NewSource(seed))
+}
+
 // NewNode 构造一个副本并加载本地持久日志与已投过票的任期。
 func NewNode(cfg NodeConfig) (*Node, error) {
 	lg := cfg.Logger
 	if lg == nil {
 		lg = discardLogger{}
 	}
-	h := fnv.New64a()
-	h.Write([]byte(cfg.ID))
-	seed := int64(h.Sum64()) ^ time.Now().UnixNano()
+	rng := newNodeRand(cfg.ID)
 	n := &Node{
 		cfg:        cfg,
 		log:        lg,
@@ -174,7 +188,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		nextIndex:  make(map[string]int64),
 		matchIndex: make(map[string]int64),
 		pending:    make(map[int64]*proposal),
-		rng:        mathrand.New(mathrand.NewSource(seed)),
+		rng:        rng,
 	}
 	logPath := ""
 	if cfg.DataDir != "" {
@@ -197,9 +211,9 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		return nil, err
 	}
 
-	// 重放日志重建已应用状态与幂等结果表。
+	// 重放日志重建已应用状态与幂等结果表（半开区间上界需 +1，含最后一条）。
 	_, last := dl.Last()
-	for _, e := range dl.Entries(1, last) {
+	for _, e := range dl.Entries(1, last+1) {
 		n.sm.Apply(e)
 	}
 	n.lastApplied = last
@@ -285,19 +299,15 @@ func (n *Node) Term() int64 {
 
 // resetElectionDeadlineLocked 安排下一次随机选举超时（调用方持锁）。
 func (n *Node) resetElectionDeadlineLocked(now time.Time) {
-	lo := n.cfg.ElectionTimeoutMin
-	hi := n.cfg.ElectionTimeoutMax
-	if lo <= 0 {
-		lo = 300 * time.Millisecond
+	base := n.cfg.ElectionTimeoutMin
+	if base <= 0 {
+		base = 200 * time.Millisecond
 	}
-	if hi <= lo {
-		hi = lo + 150*time.Millisecond
-	}
-	span := int64(hi - lo)
-	d := lo
-	if span > 0 {
-		d += time.Duration(n.rng.Int63n(span))
-	}
+	// 教科书式随机选举超时：在 [base, 3*base) 内均匀随机。
+	// 宽区间 + 高频真实时刻熵，使多节点持续同拍超时的概率随轮次指数衰减。
+	n.rng.Seed(n.rng.Int63() ^ now.UnixNano() ^ nodeRandCounter.Load()*7919)
+	span := int64(2 * base)
+	d := base + time.Duration(n.rng.Int63n(span+1))
 	n.electionDead = now.Add(d)
 }
 
@@ -330,6 +340,30 @@ func (n *Node) HandleRequestVote(req VoteRequest) VoteResponse {
 	}
 	lastTerm, lastIndex := n.dlog.Last()
 
+	// Pre-Vote：候选人用 term+1 探测但不自增任期。
+	// 规则：不更新本节点任期/votedFor；只要候选人日志不落后于本节点就可同意，
+	// 从而不会被"旧主崩溃前残留的本任期投票"锁死，也不会扰动现任主。
+	if req.PreVote {
+		lastTermP, lastIndexP := n.dlog.Last()
+		if req.Term < n.currentTerm+1 {
+			return VoteResponse{Term: n.currentTerm, Granted: false,
+				Reason: "reject prevote: stale pre-term " + itoa64(req.Term)}
+		}
+		// 若我们近期仍能听到现任主的心跳，则不该参与推翻它的预投票。
+		// （本实现中选举超时触发即说明已听不到主，故这里仅做日志新鲜度判断。）
+		if !n.isLogUpToDateLocked(req.LastLogTerm, req.LastLogIndex) {
+			return VoteResponse{Term: n.currentTerm, Granted: false,
+				Reason: "reject prevote: candidate log behind local (t" +
+					itoa64(req.LastLogTerm) + "/i" + itoa64(req.LastLogIndex) +
+					" vs t" + itoa64(lastTermP) + "/i" + itoa64(lastIndexP) + ")"}
+		}
+		// 同意预投票：记录承诺（供正式投票的安全改票判断）。
+		n.prePromised = req.Candidate
+		n.prePromiseTerm = req.Term
+		return VoteResponse{Term: n.currentTerm, Granted: true,
+			Reason: "pre-vote granted: candidate log up-to-date"}
+	}
+
 	if req.Term < n.currentTerm {
 		return VoteResponse{Term: n.currentTerm, Granted: false,
 			Reason: "reject vote: candidate term " + itoa64(req.Term) +
@@ -347,9 +381,23 @@ func (n *Node) HandleRequestVote(req VoteRequest) VoteResponse {
 			Reason: "reject vote: already leader in term " + itoa64(n.currentTerm)}
 	}
 	if n.votedFor != "" && n.votedFor != req.Candidate {
-		return VoteResponse{Term: n.currentTerm, Granted: false,
-			Reason: "reject vote: already voted for " + n.votedFor +
-				" in term " + itoa64(n.currentTerm)}
+		// 唯一允许改投的安全情形：本任期我投的对象当前不可达（其不可能再在本任期当选），
+		// 且我在对应的预投票阶段已承诺过本候选者（它日志足够新）。
+		promised := n.prePromised == req.Candidate && n.prePromiseTerm == req.Term
+		staleDown := !n.cfg.Net.Reachable(n.cfg.ID, n.votedFor)
+		if promised && staleDown {
+			n.votedFor = req.Candidate
+			if err := n.persistStateLocked(); err != nil {
+				return VoteResponse{Term: n.currentTerm, Reason: "persist vote: " + err.Error()}
+			}
+			n.log.Printf("[node %s shard %d] transfer vote in term %d from unreachable %s to promised %s",
+				n.cfg.ID, n.cfg.ShardID, n.currentTerm, n.votedFor, req.Candidate)
+		} else {
+			return VoteResponse{Term: n.currentTerm, Granted: false,
+				Reason: "reject vote: already voted for " + n.votedFor +
+					" in term " + itoa64(n.currentTerm) +
+					" (promised=" + boolStr(promised) + ", priorVoteTargetReachable=" + boolStr(!staleDown) + ")"}
+		}
 	}
 	if !n.isLogUpToDateLocked(req.LastLogTerm, req.LastLogIndex) {
 		return VoteResponse{Term: n.currentTerm, Granted: false,
@@ -508,10 +556,7 @@ func (n *Node) RaftTick(now time.Time) {
 		return
 	}
 	if n.role == Leader {
-		interval := n.cfg.ElectionTimeoutMin / 2
-		if interval <= 0 {
-			interval = 150 * time.Millisecond
-		}
+		interval := heartbeatInterval
 		due := now.Sub(n.lastHeartbeat) >= interval
 		n.mu.Unlock()
 		if due {
@@ -526,9 +571,46 @@ func (n *Node) RaftTick(now time.Time) {
 	}
 }
 
-// startElection 发起一轮选举：自增任期、投自己、向所有可达对端拉票，
-// 得多数票则当选；拒绝票与不可达都计入判定依据日志。
+// startElection 发起一轮"预投票 + 正式选举"。
+// 预投票通过（能凑齐多数派）才自增任期并持久化，避免被不可达旧主/残留投票锁死。
 func (n *Node) startElection() {
+	n.mu.Lock()
+	if n.down || n.stopped {
+		n.mu.Unlock()
+		return
+	}
+	lastTerm, lastIndex := n.dlog.Last()
+	preTerm := n.currentTerm + 1
+	peers := append([]string(nil), n.cfg.Peers...)
+	n.resetElectionDeadlineLocked(time.Now())
+	n.mu.Unlock()
+
+	// ---- 预投票阶段：不改变任何持久状态 ----
+	preReq := VoteRequest{ShardID: n.cfg.ShardID, Term: preTerm, Candidate: n.cfg.ID,
+		LastLogIndex: lastIndex, LastLogTerm: lastTerm, PreVote: true}
+	preVotes := 1
+	preGranted, preRefused := []string{n.cfg.ID}, []string{}
+	for _, p := range peers {
+		resp, err := n.cfg.Transport.RequestVote(p, preReq)
+		if err != nil {
+			preRefused = append(preRefused, p+"(unreachable)")
+			continue
+		}
+		if resp.Granted {
+			preVotes++
+			preGranted = append(preGranted, p)
+		} else {
+			preRefused = append(preRefused, p+"["+resp.Reason+"]")
+		}
+	}
+	need := Majority(n.replicaCount())
+	if preVotes < need {
+		n.log.Printf("[node %s shard %d] PRE-VOTE term~%d failed: %d/%d granted=%v refused=%v; stay follower and retry later",
+			n.cfg.ID, n.cfg.ShardID, preTerm, preVotes, n.replicaCount(), preGranted, preRefused)
+		return
+	}
+
+	// ---- 正式选举：自增任期、投自己、持久化 ----
 	n.mu.Lock()
 	if n.down || n.stopped {
 		n.mu.Unlock()
@@ -538,19 +620,18 @@ func (n *Node) startElection() {
 	n.role = Candidate
 	n.votedFor = n.cfg.ID
 	n.leader = ""
+	term := n.currentTerm
 	if err := n.persistStateLocked(); err != nil {
 		n.log.Printf("[node %s shard %d] persist term failed: %v", n.cfg.ID, n.cfg.ShardID, err)
 	}
-	lastTerm, lastIndex := n.dlog.Last()
-	term := n.currentTerm
-	peers := append([]string(nil), n.cfg.Peers...)
+	lastTerm, lastIndex = n.dlog.Last()
 	n.resetElectionDeadlineLocked(time.Now())
 	n.mu.Unlock()
 
-	n.log.Printf("[node %s shard %d] START ELECTION term=%d (log t%d/i%d), requesting votes from %d peers",
-		n.cfg.ID, n.cfg.ShardID, term, lastTerm, lastIndex, len(peers))
+	n.log.Printf("[node %s shard %d] START ELECTION term=%d (pre-vote %d granted), log t%d/i%d",
+		n.cfg.ID, n.cfg.ShardID, term, preVotes, lastTerm, lastIndex)
 
-	votes := 1 // 自己
+	votes := 1
 	granted, refused, unreachable := []string{n.cfg.ID}, []string{}, []string{}
 	req := VoteRequest{ShardID: n.cfg.ShardID, Term: term, Candidate: n.cfg.ID,
 		LastLogIndex: lastIndex, LastLogTerm: lastTerm}
@@ -567,7 +648,7 @@ func (n *Node) startElection() {
 			refused = append(refused, p+"["+resp.Reason+"]")
 		}
 		n.mu.Lock()
-		if resp.Term > term && resp.Term > n.currentTerm {
+		if resp.Term > n.currentTerm {
 			n.stepDownLocked(resp.Term, "")
 			_ = n.persistStateLocked()
 			n.mu.Unlock()
@@ -578,7 +659,6 @@ func (n *Node) startElection() {
 		n.mu.Unlock()
 	}
 
-	need := Majority(n.replicaCount())
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.down || n.stopped || n.role != Candidate || n.currentTerm != term {
@@ -591,10 +671,12 @@ func (n *Node) startElection() {
 	if votes >= need {
 		n.becomeLeaderLocked()
 	} else {
-		n.log.Printf("[node %s shard %d] cannot win: votes=%d < majority=%d (granted=%v, unreachable=%v)",
-			n.cfg.ID, n.cfg.ShardID, votes, need, granted, unreachable)
+		n.role = Follower
+		n.log.Printf("[node %s shard %d] split vote in term %d: votes=%d < majority=%d; back off",
+			n.cfg.ID, n.cfg.ShardID, term, votes, need)
 	}
 }
+
 
 // replicateMu 串行化复制轮次（心跳与提交触发可能来自不同 goroutine）。
 // replicateAll 发送一轮 AppendEntries（也是主的心跳），处理冲突回退，
@@ -932,3 +1014,10 @@ func (n *Node) Shutdown() {
 	_ = n.dlog.Close()
 }
 
+
+func boolStr(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
+}

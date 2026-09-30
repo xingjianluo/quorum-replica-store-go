@@ -7,8 +7,8 @@ import (
 
 // 默认选举超时：足够大以避免抖动，又足够小让本地测试快速观察切换。
 const (
-	defaultElectionMin = 120 * time.Millisecond
-	defaultElectionMax = 240 * time.Millisecond
+	defaultElectionMin = 200 * time.Millisecond
+	defaultElectionMax = 600 * time.Millisecond
 	defaultTick        = 20 * time.Millisecond
 )
 
