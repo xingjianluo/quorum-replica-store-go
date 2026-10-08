@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ReplicaSet owns one shard's in-memory replicas, fault model and leader term.
@@ -17,12 +18,21 @@ type ReplicaSet struct {
 	order    []string
 	alive    map[string]bool
 	blocked  map[string]bool
+	// learners 是已加入成员顺序、但尚未通过已提交配置条目获得投票权的副本。
+	// 它们不参与多数派，也不会成为候选人；配置提交后立即转为正式投票成员。
+	learners map[string]bool
 	leaderID string
 	logger   Logger
+	timing   replicaSetTiming
+	durable  durability
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	// lastLeaderContact 是后台监控最后一次确认主副本仍可达多数派的时间。
+	lastLeaderContact time.Time
 }
 
 // NewReplicaSet constructs a shard replica set and validates its configuration.
-func NewReplicaSet(spec ShardSpec) (*ReplicaSet, error) {
+func NewReplicaSet(spec ShardSpec, options ...Option) (*ReplicaSet, error) {
 	if strings.TrimSpace(spec.ID) == "" {
 		return nil, newError(KindInvalidConfig, "new-replica-set", "", "shard id is empty")
 	}
@@ -53,14 +63,61 @@ func NewReplicaSet(spec ShardSpec) (*ReplicaSet, error) {
 		Range:      spec.Range,
 		ReplicaIDs: append([]string(nil), order...),
 	}
-	return &ReplicaSet{
+	s := &ReplicaSet{
 		spec:     cloned,
 		replicas: replicas,
 		order:    order,
 		alive:    maps.Clone(seen),
 		blocked:  make(map[string]bool),
+		learners: make(map[string]bool),
 		logger:   log.Default(),
-	}, nil
+		timing:   defaultTiming(),
+	}
+	for _, opt := range options {
+		opt(s)
+	}
+	s.startFailoverLocked()
+	return s, nil
+}
+
+// newReplicaSetForRestore rebuilds a set from durable images. Members that
+// exist in the restored configuration but lack an image start empty; every
+// replica is alive because a restart means all local processes are back and
+// injected partitions no longer exist. Leadership is always re-earned.
+func newReplicaSetForRestore(spec ShardSpec, order []string, records map[string]DurableRecord, options ...Option) (*ReplicaSet, error) {
+	replicas := make(map[string]*Replica, len(order))
+	alive := make(map[string]bool, len(order))
+	for _, id := range order {
+		alive[id] = true
+		if rec, ok := records[id]; ok {
+			r, err := NewReplicaFromDurableRecord(rec)
+			if err != nil {
+				return nil, err
+			}
+			replicas[id] = r
+		} else {
+			replicas[id] = NewReplica(id, spec.ID)
+		}
+	}
+	s := &ReplicaSet{
+		spec: ShardSpec{
+			ID:         spec.ID,
+			Range:      spec.Range,
+			ReplicaIDs: append([]string(nil), order...),
+		},
+		replicas: replicas,
+		order:    append([]string(nil), order...),
+		alive:    alive,
+		blocked:  make(map[string]bool),
+		learners: make(map[string]bool),
+		logger:   log.Default(),
+		timing:   defaultTiming(),
+	}
+	for _, opt := range options {
+		opt(s)
+	}
+	s.startFailoverLocked()
+	return s, nil
 }
 
 // SetLogger replaces the diagnostic logger.
@@ -105,7 +162,42 @@ func (s *ReplicaSet) Term() uint64 {
 }
 
 func (s *ReplicaSet) quorumLocked() int {
-	return len(s.order)/2 + 1
+	return len(s.votersLocked())/2 + 1
+}
+
+// votersLocked 返回当前有投票权的成员（排除正在追赶的学习者）。
+func (s *ReplicaSet) votersLocked() []string {
+	if len(s.learners) == 0 {
+		return s.order
+	}
+	out := make([]string, 0, len(s.order))
+	for _, id := range s.order {
+		if !s.learners[id] {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func (s *ReplicaSet) aliveVotersLocked() int {
+	n := 0
+	for _, id := range s.votersLocked() {
+		if s.alive[id] {
+			n++
+		}
+	}
+	return n
+}
+
+// reachableVotersLocked 与 reachableFromLocked 相同，但只统计投票成员。
+func (s *ReplicaSet) reachableVotersLocked(from string) []string {
+	out := make([]string, 0, len(s.order))
+	for _, id := range s.votersLocked() {
+		if s.reachableLocked(from, id) {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 func partitionKey(a, b string) string {
@@ -148,7 +240,7 @@ func (s *ReplicaSet) requireReplicaLocked(id string) error {
 
 func (s *ReplicaSet) maxAliveTermLocked() uint64 {
 	var maxTerm uint64
-	for _, id := range s.order {
+	for _, id := range s.votersLocked() {
 		if s.alive[id] && s.replicas[id].currentTerm > maxTerm {
 			maxTerm = s.replicas[id].currentTerm
 		}
@@ -171,7 +263,7 @@ func (s *ReplicaSet) invalidateStaleLeaderLocked(reason string) bool {
 		return false
 	}
 	leader := s.replicas[s.leaderID]
-	reachable := s.reachableFromLocked(s.leaderID)
+	reachable := s.reachableVotersLocked(s.leaderID)
 	newerTerm := s.maxTermAmongLocked(reachable)
 	if s.alive[leader.id] && len(reachable) >= s.quorumLocked() && newerTerm <= leader.currentTerm {
 		return false
@@ -244,11 +336,71 @@ func (s *ReplicaSet) syncCommittedPrefixLocked(leader, follower *Replica) error 
 	return nil
 }
 
+// flushLocked rewrites the committed mirror of every alive member. Committed
+// entries are already persisted when they commit; this is a defensive full
+// flush used during an orderly shutdown. The caller must hold s.mu.
+func (s *ReplicaSet) flushLocked() error {
+	if s.durable == nil {
+		return nil
+	}
+	var firstErr error
+	for _, id := range s.order {
+		if !s.alive[id] {
+			continue
+		}
+		if err := s.persistLocked(s.replicas[id]); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// persistLocked writes one replica's committed-only mirror. Failures are
+// logged; callers decide whether the failure removes a durability vote.
+func (s *ReplicaSet) persistLocked(replica *Replica) error {
+	if s.durable == nil {
+		return nil
+	}
+	replica.mu.RLock()
+	rec := replica.durableSnapshotLocked()
+	replica.mu.RUnlock()
+	if err := s.durable.save(s.spec.ID, rec); err != nil {
+		s.logf("shard=%s durability save replica=%s commit=%d failed: %v",
+			s.spec.ID, replica.id, rec.CommitIndex, err)
+		return err
+	}
+	return nil
+}
+
+// applyConfigChangeLocked activates a committed membership change on the set.
+// It must run after the entry has been applied to the leader's state machine:
+// only then is the new configuration itself committed, so from this point on
+// every subsequent write uses the new quorum.
+func (s *ReplicaSet) applyConfigChangeLocked(change ConfigChange) {
+	switch change.Type {
+	case ConfigChangeAddReplica:
+		if !slices.Contains(s.order, change.ReplicaID) {
+			s.order = append(s.order, change.ReplicaID)
+			if _, ok := s.replicas[change.ReplicaID]; !ok {
+				s.replicas[change.ReplicaID] = NewReplica(change.ReplicaID, s.spec.ID)
+			}
+			s.alive[change.ReplicaID] = true
+		}
+		delete(s.learners, change.ReplicaID)
+		s.spec.ReplicaIDs = append([]string(nil), s.order...)
+		s.logf("shard=%s committed config change=add-replica replica=%s voters=%d quorum=%d",
+			s.spec.ID, change.ReplicaID, len(s.votersLocked()), s.quorumLocked())
+	default:
+		s.logf("shard=%s ignoring unknown config change type=%d replica=%s",
+			s.spec.ID, change.Type, change.ReplicaID)
+	}
+}
+
 func (s *ReplicaSet) appendAndCommitLocked(leader *Replica, entry Entry) (int, error) {
-	reachable := s.reachableFromLocked(leader.id)
-	if len(reachable) < s.quorumLocked() {
-		return len(reachable), newError(KindQuorumUnavailable, "append", s.spec.ID,
-			"reachable replicas below quorum before appending")
+	voterReachable := s.reachableVotersLocked(leader.id)
+	if len(voterReachable) < s.quorumLocked() {
+		return len(voterReachable), newError(KindQuorumUnavailable, "append", s.spec.ID,
+			"reachable voting replicas below quorum before appending")
 	}
 
 	leader.mu.Lock()
@@ -264,13 +416,21 @@ func (s *ReplicaSet) appendAndCommitLocked(leader *Replica, entry Entry) (int, e
 
 	entriesToSend := []Entry{cloneEntry(entry)}
 
+	// acks counts only voting replicas that durably hold the new entry.
 	acks := 1
-	for _, id := range reachable {
+	// Replicate to every reachable peer, including learners; a learner that has
+	// caught up to the config entry becomes a voter when the entry commits.
+	for _, id := range s.reachableFromLocked(leader.id) {
 		if id == leader.id {
 			continue
 		}
 		follower := s.replicas[id]
 		if err := s.syncCommittedPrefixLocked(leader, follower); err != nil {
+			if s.learners[id] {
+				s.logf("shard=%s entry index=%d learner=%s not ready: %v (excluded from quorum)",
+					s.spec.ID, entry.Index, id, err)
+				continue
+			}
 			s.logf("shard=%s entry index=%d failed to synchronize follower=%s: %v",
 				s.spec.ID, entry.Index, id, err)
 			return acks, err
@@ -278,21 +438,22 @@ func (s *ReplicaSet) appendAndCommitLocked(leader *Replica, entry Entry) (int, e
 		follower.mu.Lock()
 		accepted := follower.appendEntriesLocked(term, oldCommit,
 			oldCommitTerm, 0, entriesToSend)
+		follower.mu.Unlock()
 		if !accepted {
-			follower.mu.Unlock()
 			s.logf("shard=%s follower=%s rejected append index=%d after committed-prefix synchronization",
 				s.spec.ID, id, entry.Index)
 			continue
 		}
-		follower.mu.Unlock()
-		acks++
+		if !s.learners[id] {
+			acks++
+		}
 	}
 
 	if acks < s.quorumLocked() {
-		s.logf("shard=%s entry index=%d rejected: acks=%d quorum=%d reachable=%v",
-			s.spec.ID, entry.Index, acks, s.quorumLocked(), reachable)
+		s.logf("shard=%s entry index=%d rejected: voterAcks=%d quorum=%d reachableVoters=%v",
+			s.spec.ID, entry.Index, acks, s.quorumLocked(), voterReachable)
 		return acks, newError(KindQuorumUnavailable, "append", s.spec.ID,
-			"insufficient acknowledgements")
+			"insufficient voting acknowledgements")
 	}
 
 	leader.mu.Lock()
@@ -300,30 +461,69 @@ func (s *ReplicaSet) appendAndCommitLocked(leader *Replica, entry Entry) (int, e
 		leader.mu.Unlock()
 		return acks, err
 	}
+	configChange := entry.ConfigChange
 	leader.mu.Unlock()
 
-	for _, id := range reachable {
+	// Advance followers' commit points and flush their committed prefix. The
+	// entry is committed only when a voting quorum, including the leader, has
+	// the new commit durable; otherwise the caller cannot tell the client the
+	// write succeeded.
+	durableAcks := 1
+	if err := s.persistLocked(leader); err != nil {
+		return acks, newError(KindDurability, "append", s.spec.ID,
+			"leader cannot persist its committed prefix").wrap(err)
+	}
+	for _, id := range voterReachable {
 		if id == leader.id {
 			continue
 		}
 		follower := s.replicas[id]
 		follower.mu.Lock()
-		if !follower.appendEntriesLocked(term, entry.Index, entry.Term, entry.Index, nil) {
+		advanced := follower.appendEntriesLocked(term, entry.Index, entry.Term, entry.Index, nil)
+		follower.mu.Unlock()
+		if !advanced {
 			s.logf("shard=%s post-commit follower=%s cannot advance to index=%d; committed result remains durable on quorum",
 				s.spec.ID, id, entry.Index)
+			continue
 		}
-		follower.mu.Unlock()
+		if s.persistLocked(follower) == nil {
+			durableAcks++
+		}
 	}
-	s.logf("shard=%s committed entry index=%d term=%d acks=%d quorum=%d replicas=%v",
-		s.spec.ID, entry.Index, entry.Term, acks, s.quorumLocked(), reachable)
+	// Learners are flushed as well so an activated voter immediately has the
+	// committed prefix on disk, but they do not count into the durability vote.
+	for _, id := range s.reachableFromLocked(leader.id) {
+		if id == leader.id || !s.learners[id] {
+			continue
+		}
+		follower := s.replicas[id]
+		follower.mu.Lock()
+		follower.appendEntriesLocked(term, entry.Index, entry.Term, entry.Index, nil)
+		follower.mu.Unlock()
+		_ = s.persistLocked(follower)
+	}
+	if durableAcks < s.quorumLocked() {
+		s.logf("shard=%s entry index=%d cannot confirm durability: durableAcks=%d quorum=%d",
+			s.spec.ID, entry.Index, durableAcks, s.quorumLocked())
+		return acks, newError(KindDurability, "append", s.spec.ID,
+			"fewer than a voting majority persisted the committed prefix")
+	}
+
+	if configChange != nil {
+		// Membership changes take effect strictly after the config entry is
+		// committed and persisted, never when appended.
+		s.applyConfigChangeLocked(*configChange)
+	}
+	s.logf("shard=%s committed entry index=%d term=%d voterAcks=%d durableAcks=%d quorum=%d voters=%v",
+		s.spec.ID, entry.Index, entry.Term, acks, durableAcks, s.quorumLocked(), s.votersLocked())
 	return acks, nil
 }
 
 func (s *ReplicaSet) tryCandidateLocked(candidateID string, term uint64) bool {
 	candidate := s.replicas[candidateID]
-	reachable := s.reachableFromLocked(candidateID)
+	reachable := s.reachableVotersLocked(candidateID)
 	if len(reachable) < s.quorumLocked() {
-		s.logf("shard=%s candidate=%s cannot campaign: reachable=%d quorum=%d peers=%v",
+		s.logf("shard=%s candidate=%s cannot campaign: reachableVoters=%d quorum=%d peers=%v",
 			s.spec.ID, candidateID, len(reachable), s.quorumLocked(), reachable)
 		return false
 	}
@@ -336,6 +536,9 @@ func (s *ReplicaSet) tryCandidateLocked(candidateID string, term uint64) bool {
 	lastIndex := candidate.lastIndexLocked()
 	lastTerm := candidate.lastTermLocked()
 	candidate.mu.Unlock()
+	// Persist the candidate's term+vote before requesting votes, otherwise a
+	// restart during the election could let it vote again in the same term.
+	_ = s.persistLocked(candidate)
 
 	votes := 1
 	for _, voterID := range reachable {
@@ -369,6 +572,7 @@ func (s *ReplicaSet) tryCandidateLocked(candidateID string, term uint64) bool {
 		voter.votedFor = candidateID
 		voter.state = ReplicaStateFollower
 		voter.mu.Unlock()
+		_ = s.persistLocked(voter)
 		votes++
 		s.logf("shard=%s candidate=%s granted vote from=%s term=%d votes=%d/%d",
 			s.spec.ID, candidateID, voterID, term, votes, s.quorumLocked())
@@ -452,10 +656,10 @@ func (s *ReplicaSet) electLeaderLocked(preferred string) (string, error) {
 
 	if s.leaderID != "" {
 		leader := s.replicas[s.leaderID]
-		reachable := s.reachableFromLocked(s.leaderID)
+		reachable := s.reachableVotersLocked(s.leaderID)
 		newerTerm := s.maxTermAmongLocked(reachable)
 		if s.alive[leader.id] && len(reachable) >= s.quorumLocked() && newerTerm <= leader.currentTerm {
-			s.logf("shard=%s keep leader=%s: reachable=%d quorum=%d term=%d maxTerm=%d",
+			s.logf("shard=%s keep leader=%s: reachableVoters=%d quorum=%d term=%d maxTerm=%d",
 				s.spec.ID, leader.id, len(reachable), s.quorumLocked(), leader.currentTerm, newerTerm)
 			return leader.id, nil
 		}
@@ -463,7 +667,7 @@ func (s *ReplicaSet) electLeaderLocked(preferred string) (string, error) {
 	}
 
 	candidates := make([]string, 0, len(s.order))
-	for _, id := range s.order {
+	for _, id := range s.votersLocked() {
 		if s.alive[id] {
 			candidates = append(candidates, id)
 		}
@@ -525,22 +729,16 @@ func (s *ReplicaSet) CatchUp() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	aliveCount := 0
-	for _, alive := range s.alive {
-		if alive {
-			aliveCount++
-		}
-	}
-	if aliveCount < s.quorumLocked() {
+	if s.aliveVotersLocked() < s.quorumLocked() {
 		return newError(KindQuorumUnavailable, "catch-up", s.spec.ID,
-			"alive replicas below majority")
+			"alive voting replicas below majority")
 	}
 
 	if s.leaderID != "" {
 		s.invalidateStaleLeaderLocked("catch-up")
 	}
 	if s.leaderID == "" || !s.alive[s.leaderID] ||
-		len(s.reachableFromLocked(s.leaderID)) < s.quorumLocked() {
+		len(s.reachableVotersLocked(s.leaderID)) < s.quorumLocked() {
 		if _, err := s.electLeaderLocked(""); err != nil {
 			return err
 		}
@@ -558,21 +756,16 @@ func (s *ReplicaSet) CatchUp() error {
 }
 
 func (s *ReplicaSet) ensureLeaderForWriteLocked(op string) (*Replica, error) {
-	if len(s.order) < s.quorumLocked() {
+	if len(s.votersLocked()) < s.quorumLocked() {
 		return nil, newError(KindQuorumUnavailable, op, s.spec.ID,
-			"configured replica count cannot form a majority")
+			"configured voting replica count cannot form a majority")
 	}
-	aliveCount := 0
-	for _, alive := range s.alive {
-		if alive {
-			aliveCount++
-		}
-	}
+	aliveCount := s.aliveVotersLocked()
 	if aliveCount < s.quorumLocked() {
-		s.logf("shard=%s %s rejected: alive=%d configured=%d quorum=%d",
-			s.spec.ID, op, aliveCount, len(s.order), s.quorumLocked())
+		s.logf("shard=%s %s rejected: aliveVoters=%d voters=%d quorum=%d",
+			s.spec.ID, op, aliveCount, len(s.votersLocked()), s.quorumLocked())
 		return nil, newError(KindQuorumUnavailable, op, s.spec.ID,
-			"alive replicas below majority; write is not degraded")
+			"alive voting replicas below majority; write is not degraded")
 	}
 
 	if s.leaderID != "" {
@@ -592,12 +785,12 @@ func (s *ReplicaSet) ensureLeaderForWriteLocked(op string) (*Replica, error) {
 		}
 	}
 	leader := s.replicas[s.leaderID]
-	reachable := s.reachableFromLocked(leader.id)
+	reachable := s.reachableVotersLocked(leader.id)
 	if len(reachable) < s.quorumLocked() {
-		s.logf("shard=%s %s rejected after election: leader=%s reachable=%d quorum=%d",
+		s.logf("shard=%s %s rejected after election: leader=%s reachableVoters=%d quorum=%d",
 			s.spec.ID, op, leader.id, len(reachable), s.quorumLocked())
 		return nil, newError(KindQuorumUnavailable, op, s.spec.ID,
-			"leader cannot currently contact a majority")
+			"leader cannot currently contact a voting majority")
 	}
 	return leader, nil
 }
@@ -713,15 +906,9 @@ func (s *ReplicaSet) Write(ctx context.Context, req WriteRequest) (*WriteRespons
 }
 
 func (s *ReplicaSet) prepareStrongReadLocked(op string) (*Replica, uint64, error) {
-	aliveCount := 0
-	for _, alive := range s.alive {
-		if alive {
-			aliveCount++
-		}
-	}
-	if aliveCount < s.quorumLocked() {
+	if s.aliveVotersLocked() < s.quorumLocked() {
 		return nil, 0, newError(KindQuorumUnavailable, op, s.spec.ID,
-			"alive replicas below majority for a strong read")
+			"alive voting replicas below majority for a strong read")
 	}
 	if s.leaderID == "" || !s.alive[s.leaderID] {
 		if _, err := s.electLeaderLocked(""); err != nil {
@@ -729,7 +916,7 @@ func (s *ReplicaSet) prepareStrongReadLocked(op string) (*Replica, uint64, error
 		}
 	}
 	leader := s.replicas[s.leaderID]
-	reachable := s.reachableFromLocked(leader.id)
+	reachable := s.reachableVotersLocked(leader.id)
 	if len(reachable) < s.quorumLocked() {
 		return nil, 0, newError(KindStrongReadUnsafe, op, s.spec.ID,
 			"leader cannot contact a read quorum")
@@ -854,10 +1041,10 @@ func (s *ReplicaSet) Read(ctx context.Context, req ReadRequest) (*ReadResponse, 
 	}
 	replica.mu.RUnlock()
 	maxCommit := s.maxCommitIndexLocked()
-	reachableCount := len(s.reachableFromLocked(replicaID))
+	reachableCount := len(s.reachableVotersLocked(replicaID))
 	quorumUnavailable := reachableCount < s.quorumLocked()
 	stale := commit < maxCommit || quorumUnavailable
-	s.logf("shard=%s eventual read replica=%s commitIndex=%d maxAliveCommit=%d reachable=%d/%d stale=%t",
+	s.logf("shard=%s eventual read replica=%s commitIndex=%d maxAliveCommit=%d reachableVoters=%d/%d stale=%t",
 		s.spec.ID, replicaID, commit, maxCommit, reachableCount, s.quorumLocked(), stale)
 	return &ReadResponse{
 		ShardID:     s.spec.ID,

@@ -14,6 +14,7 @@ func TestRangeShardBoundariesAndRouting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = store.Close() })
 	ctx := context.Background()
 	cases := []struct {
 		key  string
@@ -109,6 +110,7 @@ func TestWritesAreIsolatedByOwningShard(t *testing.T) {
 		t.Fatal(err)
 	}
 	store.SetLogger(testLogger{t})
+	t.Cleanup(func() { _ = store.Close() })
 
 	lowResp, err := store.Write(ctx, WriteRequest{ShardID: "low", Key: "a", Value: []byte("low"), RequestID: "low-1"})
 	if err != nil {

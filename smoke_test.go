@@ -23,6 +23,7 @@ func testStore(t *testing.T) *Store {
 		t.Fatalf("NewStore: %v", err)
 	}
 	store.SetLogger(testLogger{t})
+	t.Cleanup(func() { _ = store.Close() })
 	return store
 }
 

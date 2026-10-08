@@ -23,6 +23,9 @@ const (
 	KindInvalidReadMode    ErrorKind = "invalid_read_mode"
 	KindStrongReadUnsafe   ErrorKind = "strong_read_unsafe"
 	KindInvalidArgument    ErrorKind = "invalid_argument"
+	KindDurability         ErrorKind = "durability_failed"
+	KindConfigChange       ErrorKind = "config_change_rejected"
+	KindClosed             ErrorKind = "closed"
 )
 
 // Error 携带操作、分片和判定细节，便于测试日志直接定位拒绝依据。
@@ -53,6 +56,12 @@ func (e *Error) Error() string {
 	return prefix
 }
 func (e *Error) Unwrap() error { return e.Err }
+
+// wrap attaches a causal error to a classified quorum error.
+func (e *Error) wrap(cause error) *Error {
+	e.Err = cause
+	return e
+}
 
 func newError(kind ErrorKind, op, shardID, detail string) *Error {
 	return &Error{Kind: kind, Op: op, ShardID: shardID, Detail: detail}

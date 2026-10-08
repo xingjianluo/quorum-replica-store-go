@@ -14,6 +14,7 @@ func newFiveReplicaStore(t *testing.T) (*Store, *ReplicaSet) {
 		t.Fatal(err)
 	}
 	store.SetLogger(testLogger{t})
+	t.Cleanup(func() { _ = store.Close() })
 	shard, err := store.Shard("five")
 	if err != nil {
 		t.Fatal(err)

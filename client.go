@@ -65,7 +65,8 @@ func (c *Client) Write(ctx context.Context, req WriteRequest) (*WriteResponse, e
 		lastErr = err
 		var qerr *Error
 		retryable := errors.As(err, &qerr) &&
-			(qerr.Kind == KindQuorumUnavailable || qerr.Kind == KindNoLeader || qerr.Kind == KindNotLeader)
+			(qerr.Kind == KindQuorumUnavailable || qerr.Kind == KindNoLeader ||
+				qerr.Kind == KindNotLeader || qerr.Kind == KindDurability)
 		if !retryable || attempt == c.maxAttempts {
 			c.logf("write request=%s final failure on attempt=%d retryable=%t: %v",
 				req.RequestID, attempt, retryable, err)

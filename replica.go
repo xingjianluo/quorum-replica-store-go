@@ -1,6 +1,7 @@
 package quorum
 
 import (
+	"fmt"
 	"sync"
 )
 
@@ -43,6 +44,112 @@ func NewReplica(id, shardID string) *Replica {
 		data:    make(map[string]*Value),
 		results: make(map[string]committedResult),
 	}
+}
+
+// NewReplicaFromDurableRecord rebuilds a replica from a committed-only mirror.
+// Uncommitted entries were never part of the record, so a replica rebuilt
+// here cannot republish a write that only existed on a minority before stop.
+func NewReplicaFromDurableRecord(rec DurableRecord) (*Replica, error) {
+	if rec.ReplicaID == "" || rec.ShardID == "" {
+		return nil, newError(KindDurability, "restore", rec.ShardID,
+			"durable record is missing shard or replica identity")
+	}
+	if rec.FormatVersion != durableFormatVersion {
+		return nil, newError(KindDurability, "restore", rec.ShardID,
+			fmt.Sprintf("unsupported durable format version %d", rec.FormatVersion))
+	}
+	if uint64(len(rec.Log)) < rec.CommitIndex {
+		return nil, newError(KindDurability, "restore", rec.ShardID,
+			"durable record log is shorter than its commit index")
+	}
+	r := NewReplica(rec.ReplicaID, rec.ShardID)
+	if err := r.restoreFromDurableLocked(cloneDurableRecord(rec)); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// durableSnapshotLocked exports the committed prefix, hard state and the state
+// machine reconstructed from it. The caller must hold r.mu.
+func (r *Replica) durableSnapshotLocked() DurableRecord {
+	logCopy := make([]Entry, r.commitIndex)
+	copy(logCopy, r.log[:r.commitIndex])
+	dataCopy := make(map[string]Value, len(r.data))
+	for key, value := range r.data {
+		dataCopy[key] = *cloneValue(value)
+	}
+	resultsCopy := make(map[string]durableResult, len(r.results))
+	for requestID, result := range r.results {
+		resultsCopy[requestID] = durableResult{
+			RequestID:      result.requestID,
+			Key:            result.key,
+			Value:          cloneBytes(result.value),
+			CompareVersion: cloneUint64Ptr(result.compareVersion),
+			Version:        result.version,
+			CommitIndex:    result.commitIndex,
+			CommitTerm:     result.commitTerm,
+		}
+	}
+	return DurableRecord{
+		FormatVersion: durableFormatVersion,
+		ShardID:       r.shardID,
+		ReplicaID:     r.id,
+		CurrentTerm:   r.currentTerm,
+		VotedFor:      r.votedFor,
+		CommitIndex:   r.commitIndex,
+		Log:           logCopy,
+		Data:          dataCopy,
+		Results:       resultsCopy,
+	}
+}
+
+// restoreFromDurableLocked loads hard state and committed state machine. The
+// restored replica is always a follower: leadership must be re-earned after a
+// full restart, never assumed from old local role. The caller must hold r.mu.
+func (r *Replica) restoreFromDurableLocked(rec DurableRecord) error {
+	if rec.ReplicaID != r.id || rec.ShardID != r.shardID {
+		return newError(KindDurability, "restore", r.shardID,
+			"durable record identity "+rec.ShardID+"/"+rec.ReplicaID+
+				" does not match replica "+r.shardID+"/"+r.id)
+	}
+	for i, entry := range rec.Log {
+		if uint64(i+1) != entry.Index {
+			return newError(KindDurability, "restore", r.shardID,
+				fmt.Sprintf("durable log entry %d has non-contiguous index %d", i+1, entry.Index))
+		}
+	}
+
+	data := make(map[string]*Value, len(rec.Data))
+	for key, value := range rec.Data {
+		v := value
+		v.Data = cloneBytes(value.Data)
+		data[key] = &v
+	}
+	results := make(map[string]committedResult, len(rec.Results))
+	for requestID, result := range rec.Results {
+		results[requestID] = committedResult{
+			requestID:      result.RequestID,
+			key:            result.Key,
+			value:          cloneBytes(result.Value),
+			compareVersion: cloneUint64Ptr(result.CompareVersion),
+			version:        result.Version,
+			commitIndex:    result.CommitIndex,
+			commitTerm:     result.CommitTerm,
+		}
+	}
+
+	logCopy := make([]Entry, len(rec.Log))
+	for i := range rec.Log {
+		logCopy[i] = cloneEntry(rec.Log[i])
+	}
+	r.currentTerm = rec.CurrentTerm
+	r.votedFor = rec.VotedFor
+	r.commitIndex = rec.CommitIndex
+	r.log = logCopy
+	r.data = data
+	r.results = results
+	r.state = ReplicaStateFollower
+	return nil
 }
 
 func (r *Replica) ID() string      { return r.id }

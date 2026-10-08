@@ -15,6 +15,7 @@ func TestDistinguishableRejectionReasons(t *testing.T) {
 		t.Fatal(err)
 	}
 	store.SetLogger(testLogger{t})
+	t.Cleanup(func() { _ = store.Close() })
 	low, err := store.Shard("low")
 	if err != nil {
 		t.Fatal(err)
