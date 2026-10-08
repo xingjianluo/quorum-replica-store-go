@@ -114,6 +114,53 @@ func (r *Replica) becomeFollowerLocked(term uint64) {
 	r.state = ReplicaStateFollower
 }
 
+// snapshotLocked captures exactly the durable state: term, vote and the
+// committed log prefix. Uncommitted tail entries are deliberately dropped, so
+// a write that only ever reached a minority cannot reappear after restart.
+func (r *Replica) snapshotLocked() replicaSnapshot {
+	entries := make([]Entry, r.commitIndex)
+	copy(entries, r.log[:r.commitIndex])
+	return replicaSnapshot{
+		ID:          r.id,
+		CurrentTerm: r.currentTerm,
+		VotedFor:    r.votedFor,
+		CommitIndex: r.commitIndex,
+		Entries:     entries,
+	}
+}
+
+// installSnapshotLocked rebuilds the replica from a durable snapshot: term and
+// vote are restored, the log is reset to the committed prefix and key state
+// plus request-ID results are re-derived by replaying it. Replaying the same
+// committed log yields exactly the original versions; it cannot regenerate a
+// dropped uncommitted entry.
+func (r *Replica) installSnapshotLocked(snap replicaSnapshot) error {
+	for i, entry := range snap.Entries {
+		if entry.Index != uint64(i+1) {
+			return newError(KindInvalidArgument, "restore", r.shardID,
+				"snapshot log has a gap or reordered index")
+		}
+	}
+	if snap.CommitIndex != uint64(len(snap.Entries)) {
+		return newError(KindInvalidArgument, "restore", r.shardID,
+			"snapshot commit index does not match its committed log length")
+	}
+	r.currentTerm = snap.CurrentTerm
+	r.votedFor = snap.VotedFor
+	r.state = ReplicaStateFollower
+	r.log = make([]Entry, 0, len(snap.Entries))
+	for _, entry := range snap.Entries {
+		r.appendEntryLocked(entry)
+	}
+	r.data = make(map[string]*Value)
+	r.results = make(map[string]committedResult)
+	r.commitIndex = 0
+	if err := r.applyCommittedLocked(snap.CommitIndex); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (r *Replica) discardUncommittedLocked() {
 	r.log = r.log[:r.commitIndex]
 }

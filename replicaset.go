@@ -2,11 +2,13 @@ package quorum
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"maps"
 	"slices"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ReplicaSet owns one shard's in-memory replicas, fault model and leader term.
@@ -19,6 +21,24 @@ type ReplicaSet struct {
 	blocked  map[string]bool
 	leaderID string
 	logger   Logger
+
+	// Membership: voters are the replicas whose acknowledgement counts
+	// toward the active quorum; learners catch the committed prefix but do
+	// not vote. During a joint change both old and new majorities are
+	// required. order always lists every known member.
+	persister *persistence
+	voters    []string
+	learners  []string
+	joint     bool
+	oldVoters []string
+	newVoters []string
+
+	// Background supervisor lifecycle.
+	tickInterval time.Duration
+	elapsedTicks map[string]int
+	running      bool
+	stopCh       chan struct{}
+	wg           sync.WaitGroup
 }
 
 // NewReplicaSet constructs a shard replica set and validates its configuration.
@@ -54,12 +74,15 @@ func NewReplicaSet(spec ShardSpec) (*ReplicaSet, error) {
 		ReplicaIDs: append([]string(nil), order...),
 	}
 	return &ReplicaSet{
-		spec:     cloned,
-		replicas: replicas,
-		order:    order,
-		alive:    maps.Clone(seen),
-		blocked:  make(map[string]bool),
-		logger:   log.Default(),
+		spec:         cloned,
+		replicas:     replicas,
+		order:        order,
+		voters:       append([]string(nil), order...),
+		alive:        maps.Clone(seen),
+		blocked:      make(map[string]bool),
+		elapsedTicks: make(map[string]int),
+		tickInterval: DefaultTickInterval,
+		logger:       log.Default(),
 	}, nil
 }
 
@@ -76,6 +99,23 @@ func (s *ReplicaSet) logf(format string, args ...any) {
 	if s.logger != nil {
 		s.logger.Printf(format, args...)
 	}
+}
+
+// persistReplicaLocked flushes one replica's committed prefix, term and vote.
+// The caller holds the set lock and the replica lock. When no data directory
+// is configured it is a no-op, preserving the pure in-memory behavior.
+func (s *ReplicaSet) persistReplicaLocked(replica *Replica) error {
+	if s.persister == nil || !s.persister.enabled() {
+		return nil
+	}
+	return s.persister.saveReplica(s.spec.ID, replica.snapshotLocked())
+}
+
+// persistReplicaSetLocked acquires the replica lock for the flush.
+func (s *ReplicaSet) persistReplicaSetLocked(replica *Replica) error {
+	replica.mu.Lock()
+	defer replica.mu.Unlock()
+	return s.persistReplicaLocked(replica)
 }
 
 func (s *ReplicaSet) Spec() ShardSpec {
@@ -105,7 +145,13 @@ func (s *ReplicaSet) Term() uint64 {
 }
 
 func (s *ReplicaSet) quorumLocked() int {
-	return len(s.order)/2 + 1
+	return s.quorumForLocked(s.activeBallotModeLocked())
+}
+
+// jointQuorumsLocked reports the two distinct majorities required while a
+// joint configuration entry is being committed.
+func (s *ReplicaSet) jointQuorumsLocked() (oldQ, newQ int) {
+	return majorityOf(len(s.oldVoters)), majorityOf(len(s.newVoters))
 }
 
 func partitionKey(a, b string) string {
@@ -171,20 +217,27 @@ func (s *ReplicaSet) invalidateStaleLeaderLocked(reason string) bool {
 		return false
 	}
 	leader := s.replicas[s.leaderID]
-	reachable := s.reachableFromLocked(s.leaderID)
-	newerTerm := s.maxTermAmongLocked(reachable)
-	if s.alive[leader.id] && len(reachable) >= s.quorumLocked() && newerTerm <= leader.currentTerm {
+	reachableVoters := s.reachableMembersLocked(s.leaderID, s.voters)
+	reachableAll := s.reachableFromLocked(s.leaderID)
+	newerTerm := s.maxTermAmongLocked(reachableAll)
+	if s.alive[leader.id] && len(reachableVoters) >= s.quorumLocked() && newerTerm <= leader.currentTerm {
 		return false
 	}
 	leader.mu.Lock()
+	oldTerm := leader.currentTerm
 	if newerTerm > leader.currentTerm {
 		leader.becomeFollowerLocked(newerTerm)
 	} else {
 		leader.state = ReplicaStateFollower
 	}
+	persistErr := s.persistReplicaLocked(leader)
 	leader.mu.Unlock()
-	s.logf("shard=%s invalidate stale leader=%s reason=%s reachable=%d quorum=%d newerTerm=%d oldTerm=%d",
-		s.spec.ID, leader.id, reason, len(reachable), s.quorumLocked(), newerTerm, leader.currentTerm)
+	if persistErr != nil {
+		s.logf("shard=%s failed to flush demotion of leader=%s term %d->%d: %v",
+			s.spec.ID, leader.id, oldTerm, newerTerm, persistErr)
+	}
+	s.logf("shard=%s invalidate stale leader=%s reason=%s reachableVoters=%d quorum=%d newerTerm=%d oldTerm=%d",
+		s.spec.ID, leader.id, reason, len(reachableVoters), s.quorumLocked(), newerTerm, leader.currentTerm)
 	s.leaderID = ""
 	return true
 }
@@ -192,11 +245,18 @@ func (s *ReplicaSet) invalidateStaleLeaderLocked(reason string) bool {
 func (s *ReplicaSet) resetForFollowerLocked(leader, follower *Replica, reason string) {
 	follower.mu.Lock()
 	defer follower.mu.Unlock()
+	oldTerm := follower.currentTerm
 	if follower.currentTerm != leader.currentTerm || follower.state != ReplicaStateFollower {
 		s.logf("shard=%s reset replica=%s to follower term=%d reason=%s oldTerm=%d oldState=%d",
 			s.spec.ID, follower.id, leader.currentTerm, reason, follower.currentTerm, follower.state)
 	}
 	follower.becomeFollowerLocked(leader.currentTerm)
+	if oldTerm != follower.currentTerm {
+		if err := s.persistReplicaLocked(follower); err != nil {
+			s.logf("shard=%s failed to flush term bump on replica=%s term %d->%d: %v",
+				s.spec.ID, follower.id, oldTerm, follower.currentTerm, err)
+		}
+	}
 }
 
 // syncCommittedPrefixLocked makes a reachable follower's committed log and key
@@ -239,16 +299,122 @@ func (s *ReplicaSet) syncCommittedPrefixLocked(leader, follower *Replica) error 
 			s.spec.ID, follower.id, leader.id, err)
 		return err
 	}
+	if err := s.persistReplicaLocked(follower); err != nil {
+		return err
+	}
 	s.logf("shard=%s caught up replica=%s to leader=%s commitIndex=%d term=%d",
 		s.spec.ID, follower.id, leader.id, leaderCommit, leaderTerm)
 	return nil
 }
 
-func (s *ReplicaSet) appendAndCommitLocked(leader *Replica, entry Entry) (int, error) {
-	reachable := s.reachableFromLocked(leader.id)
-	if len(reachable) < s.quorumLocked() {
-		return len(reachable), newError(KindQuorumUnavailable, "append", s.spec.ID,
-			"reachable replicas below quorum before appending")
+func (s *ReplicaSet) appendAndCommitLocked(leader *Replica, entry Entry) (commitPolicy, error) {
+	return s.appendAndCommitModeLocked(leader, entry, s.activeBallotModeLocked(), nil)
+}
+
+// ballot tracks acknowledgements separately per membership side during a
+// joint commit, while keeping a single monotonic counter for the common path.
+type commitPolicy struct {
+	mode    ballotMode
+	oldIDs  []string
+	newIDs  []string
+	oldQ    int
+	newQ    int
+	oldAcks int
+	newAcks int
+}
+
+func (s *ReplicaSet) newCommitPolicyLocked(mode ballotMode) commitPolicy {
+	p := commitPolicy{mode: mode}
+	switch mode {
+	case ballotJoint:
+		p.oldIDs = s.oldVoters
+		p.newIDs = s.newVoters
+		p.oldQ, p.newQ = s.jointQuorumsLocked()
+	default:
+		p.oldIDs = s.voters
+		p.oldQ = s.quorumForLocked(ballotNormal)
+	}
+	return p
+}
+
+func (p *commitPolicy) members() []string {
+	if p.mode == ballotJoint {
+		// Every member of either side must receive the joint entry, but only
+		// voter acks count. Union keeps the set deduplicated.
+		seen := make(map[string]bool, len(p.oldIDs)+len(p.newIDs))
+		out := make([]string, 0, len(p.oldIDs)+len(p.newIDs))
+		for _, id := range append(append([]string(nil), p.oldIDs...), p.newIDs...) {
+			if !seen[id] {
+				seen[id] = true
+				out = append(out, id)
+			}
+		}
+		return out
+	}
+	return p.oldIDs
+}
+
+func (p *commitPolicy) countAck(id string) {
+	if p.mode == ballotJoint {
+		if containsID(p.oldIDs, id) {
+			p.oldAcks++
+		}
+		if containsID(p.newIDs, id) {
+			p.newAcks++
+		}
+		return
+	}
+	if containsID(p.oldIDs, id) {
+		p.oldAcks++
+	}
+}
+
+func (p *commitPolicy) satisfied() bool {
+	if p.mode == ballotJoint {
+		return p.oldAcks >= p.oldQ && p.newAcks >= p.newQ
+	}
+	return p.oldAcks >= p.oldQ
+}
+
+func (p *commitPolicy) describe() string {
+	if p.mode == ballotJoint {
+		return fmt.Sprintf("joint oldAcks=%d/%d newAcks=%d/%d", p.oldAcks, p.oldQ, p.newAcks, p.newQ)
+	}
+	return fmt.Sprintf("acks=%d/%d", p.oldAcks, p.oldQ)
+}
+
+// appendAndCommitModeLocked replicates one entry and waits for the quorum
+// dictated by mode. onCommitted runs after the leader applies the entry but
+// before followers are notified, which is exactly the instant a membership
+// change becomes effective.
+func (s *ReplicaSet) appendAndCommitModeLocked(leader *Replica, entry Entry, mode ballotMode,
+	onCommitted func() error) (commitPolicy, error) {
+	policy := s.newCommitPolicyLocked(mode)
+	targets := policy.members()
+
+	// Count reachable acks per membership side, including the leader's own
+	// vote, before appending anything. This is the same accounting used after
+	// replication, so a missing majority is rejected up front.
+	pre := commitPolicy{mode: policy.mode, oldIDs: policy.oldIDs, newIDs: policy.newIDs,
+		oldQ: policy.oldQ, newQ: policy.newQ}
+	reachableTargets := make([]string, 0, len(targets))
+	for _, id := range targets {
+		if s.reachableLocked(leader.id, id) {
+			reachableTargets = append(reachableTargets, id)
+			pre.countAck(id)
+		}
+	}
+	// Pre-check: even before appending, an unreachable old or new majority
+	// makes a joint commit impossible; refuse instead of half-committing.
+	if mode == ballotJoint {
+		if pre.oldAcks < pre.oldQ || pre.newAcks < pre.newQ {
+			return policy, newError(KindQuorumUnavailable, "append", s.spec.ID,
+				fmt.Sprintf("joint quorum unreachable before append: old=%d/%d new=%d/%d",
+					pre.oldAcks, pre.oldQ, pre.newAcks, pre.newQ))
+		}
+	} else if pre.oldAcks < pre.oldQ {
+		return policy, newError(KindQuorumUnavailable, "append", s.spec.ID,
+			fmt.Sprintf("reachable voters below quorum before appending: %s", pre.describe()))
 	}
 
 	leader.mu.Lock()
@@ -263,67 +429,85 @@ func (s *ReplicaSet) appendAndCommitLocked(leader *Replica, entry Entry) (int, e
 	leader.mu.Unlock()
 
 	entriesToSend := []Entry{cloneEntry(entry)}
+	policy.countAck(leader.id)
 
-	acks := 1
-	for _, id := range reachable {
+	for _, id := range reachableTargets {
 		if id == leader.id {
 			continue
 		}
 		follower := s.replicas[id]
 		if err := s.syncCommittedPrefixLocked(leader, follower); err != nil {
-			s.logf("shard=%s entry index=%d failed to synchronize follower=%s: %v",
+			s.logf("shard=%s entry index=%d failed to synchronize member=%s: %v",
 				s.spec.ID, entry.Index, id, err)
-			return acks, err
+			continue
 		}
 		follower.mu.Lock()
 		accepted := follower.appendEntriesLocked(term, oldCommit,
 			oldCommitTerm, 0, entriesToSend)
 		if !accepted {
 			follower.mu.Unlock()
-			s.logf("shard=%s follower=%s rejected append index=%d after committed-prefix synchronization",
+			s.logf("shard=%s member=%s rejected append index=%d after committed-prefix synchronization",
 				s.spec.ID, id, entry.Index)
 			continue
 		}
 		follower.mu.Unlock()
-		acks++
+		policy.countAck(id)
 	}
 
-	if acks < s.quorumLocked() {
-		s.logf("shard=%s entry index=%d rejected: acks=%d quorum=%d reachable=%v",
-			s.spec.ID, entry.Index, acks, s.quorumLocked(), reachable)
-		return acks, newError(KindQuorumUnavailable, "append", s.spec.ID,
-			"insufficient acknowledgements")
+	if !policy.satisfied() {
+		s.logf("shard=%s entry index=%d rejected: %s reachable=%v",
+			s.spec.ID, entry.Index, policy.describe(), reachableTargets)
+		return policy, newError(KindQuorumUnavailable, "append", s.spec.ID,
+			"insufficient acknowledgements: "+policy.describe())
 	}
 
 	leader.mu.Lock()
 	if err := leader.applyCommittedLocked(entry.Index); err != nil {
 		leader.mu.Unlock()
-		return acks, err
+		return policy, err
+	}
+	if err := s.persistReplicaLocked(leader); err != nil {
+		leader.mu.Unlock()
+		return policy, err
 	}
 	leader.mu.Unlock()
 
-	for _, id := range reachable {
+	if onCommitted != nil {
+		if err := onCommitted(); err != nil {
+			return policy, err
+		}
+	}
+
+	for _, id := range reachableTargets {
 		if id == leader.id {
 			continue
 		}
 		follower := s.replicas[id]
 		follower.mu.Lock()
 		if !follower.appendEntriesLocked(term, entry.Index, entry.Term, entry.Index, nil) {
-			s.logf("shard=%s post-commit follower=%s cannot advance to index=%d; committed result remains durable on quorum",
+			s.logf("shard=%s post-commit member=%s cannot advance to index=%d; committed result remains durable on quorum",
 				s.spec.ID, id, entry.Index)
+		} else if err := s.persistReplicaLocked(follower); err != nil {
+			follower.mu.Unlock()
+			return policy, err
 		}
 		follower.mu.Unlock()
 	}
-	s.logf("shard=%s committed entry index=%d term=%d acks=%d quorum=%d replicas=%v",
-		s.spec.ID, entry.Index, entry.Term, acks, s.quorumLocked(), reachable)
-	return acks, nil
+	s.logf("shard=%s committed entry index=%d term=%d %s replicas=%v",
+		s.spec.ID, entry.Index, entry.Term, policy.describe(), reachableTargets)
+	return policy, nil
 }
 
 func (s *ReplicaSet) tryCandidateLocked(candidateID string, term uint64) bool {
 	candidate := s.replicas[candidateID]
-	reachable := s.reachableFromLocked(candidateID)
+	if !s.isVoterLocked(candidateID) {
+		s.logf("shard=%s candidate=%s cannot campaign: non-voter (learner or removed member)",
+			s.spec.ID, candidateID)
+		return false
+	}
+	reachable := s.reachableMembersLocked(candidateID, s.voters)
 	if len(reachable) < s.quorumLocked() {
-		s.logf("shard=%s candidate=%s cannot campaign: reachable=%d quorum=%d peers=%v",
+		s.logf("shard=%s candidate=%s cannot campaign: reachableVoters=%d quorum=%d peers=%v",
 			s.spec.ID, candidateID, len(reachable), s.quorumLocked(), reachable)
 		return false
 	}
@@ -335,6 +519,12 @@ func (s *ReplicaSet) tryCandidateLocked(candidateID string, term uint64) bool {
 	candidate.discardUncommittedLocked()
 	lastIndex := candidate.lastIndexLocked()
 	lastTerm := candidate.lastTermLocked()
+	if err := s.persistReplicaLocked(candidate); err != nil {
+		candidate.mu.Unlock()
+		s.logf("shard=%s candidate=%s term=%d cannot make term durable: %v",
+			s.spec.ID, candidateID, term, err)
+		return false
+	}
 	candidate.mu.Unlock()
 
 	votes := 1
@@ -352,6 +542,12 @@ func (s *ReplicaSet) tryCandidateLocked(candidateID string, term uint64) bool {
 		}
 		if voter.currentTerm < term {
 			voter.becomeFollowerLocked(term)
+			if err := s.persistReplicaLocked(voter); err != nil {
+				voter.mu.Unlock()
+				s.logf("shard=%s candidate=%s term=%d could not flush term on voter=%s: %v",
+					s.spec.ID, candidateID, term, voterID, err)
+				continue
+			}
 		}
 		if voter.votedFor != "" && voter.votedFor != candidateID {
 			s.logf("shard=%s candidate=%s rejected vote from=%s: already voted for=%s term=%d",
@@ -368,6 +564,12 @@ func (s *ReplicaSet) tryCandidateLocked(candidateID string, term uint64) bool {
 		}
 		voter.votedFor = candidateID
 		voter.state = ReplicaStateFollower
+		if err := s.persistReplicaLocked(voter); err != nil {
+			voter.mu.Unlock()
+			s.logf("shard=%s candidate=%s vote from=%s term=%d could not be made durable: %v",
+				s.spec.ID, candidateID, voterID, term, err)
+			continue
+		}
 		voter.mu.Unlock()
 		votes++
 		s.logf("shard=%s candidate=%s granted vote from=%s term=%d votes=%d/%d",
@@ -432,9 +634,19 @@ func (s *ReplicaSet) tryCandidateLocked(candidateID string, term uint64) bool {
 	acks, err := s.appendAndCommitLocked(candidate, noop)
 	if err != nil {
 		s.leaderID = ""
-		s.logf("shard=%s leader=%s failed to commit term=%d no-op after acks=%d: %v",
-			s.spec.ID, candidateID, term, acks, err)
+		s.logf("shard=%s leader=%s failed to commit term=%d no-op after %s: %v",
+			s.spec.ID, candidateID, term, acks.describe(), err)
 		return false
+	}
+	// If a previous leader crashed between the committed joint entry and the
+	// new-config entry, the new leader takes over while the shard is still in
+	// the (safe, stricter) joint state. Finish the pending change now: this
+	// only succeeds when the new-config majority is reachable.
+	if s.joint {
+		if err := s.finalizeJointAfterElectionLocked(candidate); err != nil {
+			s.logf("shard=%s leader=%s keeps serving in joint state; pending reconfiguration not yet completable: %v",
+				s.spec.ID, candidateID, err)
+		}
 	}
 	return true
 }
@@ -452,18 +664,18 @@ func (s *ReplicaSet) electLeaderLocked(preferred string) (string, error) {
 
 	if s.leaderID != "" {
 		leader := s.replicas[s.leaderID]
-		reachable := s.reachableFromLocked(s.leaderID)
-		newerTerm := s.maxTermAmongLocked(reachable)
-		if s.alive[leader.id] && len(reachable) >= s.quorumLocked() && newerTerm <= leader.currentTerm {
-			s.logf("shard=%s keep leader=%s: reachable=%d quorum=%d term=%d maxTerm=%d",
-				s.spec.ID, leader.id, len(reachable), s.quorumLocked(), leader.currentTerm, newerTerm)
+		reachableVoters := s.reachableMembersLocked(s.leaderID, s.voters)
+		newerTerm := s.maxTermAmongLocked(s.reachableFromLocked(s.leaderID))
+		if s.alive[leader.id] && len(reachableVoters) >= s.quorumLocked() && newerTerm <= leader.currentTerm {
+			s.logf("shard=%s keep leader=%s: reachableVoters=%d quorum=%d term=%d maxTerm=%d",
+				s.spec.ID, leader.id, len(reachableVoters), s.quorumLocked(), leader.currentTerm, newerTerm)
 			return leader.id, nil
 		}
 		s.invalidateStaleLeaderLocked("explicit-election")
 	}
 
-	candidates := make([]string, 0, len(s.order))
-	for _, id := range s.order {
+	candidates := make([]string, 0, len(s.voters))
+	for _, id := range s.voters {
 		if s.alive[id] {
 			candidates = append(candidates, id)
 		}
@@ -525,22 +737,17 @@ func (s *ReplicaSet) CatchUp() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	aliveCount := 0
-	for _, alive := range s.alive {
-		if alive {
-			aliveCount++
-		}
-	}
-	if aliveCount < s.quorumLocked() {
+	aliveVoters := len(s.aliveVotersLocked())
+	if aliveVoters < s.quorumLocked() {
 		return newError(KindQuorumUnavailable, "catch-up", s.spec.ID,
-			"alive replicas below majority")
+			"alive voting replicas below majority")
 	}
 
 	if s.leaderID != "" {
 		s.invalidateStaleLeaderLocked("catch-up")
 	}
 	if s.leaderID == "" || !s.alive[s.leaderID] ||
-		len(s.reachableFromLocked(s.leaderID)) < s.quorumLocked() {
+		len(s.reachableMembersLocked(s.leaderID, s.voters)) < s.quorumLocked() {
 		if _, err := s.electLeaderLocked(""); err != nil {
 			return err
 		}
@@ -558,21 +765,16 @@ func (s *ReplicaSet) CatchUp() error {
 }
 
 func (s *ReplicaSet) ensureLeaderForWriteLocked(op string) (*Replica, error) {
-	if len(s.order) < s.quorumLocked() {
+	if len(s.voters) < s.quorumLocked() {
 		return nil, newError(KindQuorumUnavailable, op, s.spec.ID,
-			"configured replica count cannot form a majority")
+			"configured voter count cannot form a majority")
 	}
-	aliveCount := 0
-	for _, alive := range s.alive {
-		if alive {
-			aliveCount++
-		}
-	}
-	if aliveCount < s.quorumLocked() {
-		s.logf("shard=%s %s rejected: alive=%d configured=%d quorum=%d",
-			s.spec.ID, op, aliveCount, len(s.order), s.quorumLocked())
+	aliveVoters := len(s.aliveVotersLocked())
+	if aliveVoters < s.quorumLocked() {
+		s.logf("shard=%s %s rejected: aliveVoters=%d configuredVoters=%d quorum=%d",
+			s.spec.ID, op, aliveVoters, len(s.voters), s.quorumLocked())
 		return nil, newError(KindQuorumUnavailable, op, s.spec.ID,
-			"alive replicas below majority; write is not degraded")
+			"alive voting replicas below majority; write is not degraded")
 	}
 
 	if s.leaderID != "" {
@@ -592,12 +794,12 @@ func (s *ReplicaSet) ensureLeaderForWriteLocked(op string) (*Replica, error) {
 		}
 	}
 	leader := s.replicas[s.leaderID]
-	reachable := s.reachableFromLocked(leader.id)
+	reachable := s.reachableMembersLocked(leader.id, s.voters)
 	if len(reachable) < s.quorumLocked() {
-		s.logf("shard=%s %s rejected after election: leader=%s reachable=%d quorum=%d",
+		s.logf("shard=%s %s rejected after election: leader=%s reachableVoters=%d quorum=%d",
 			s.spec.ID, op, leader.id, len(reachable), s.quorumLocked())
 		return nil, newError(KindQuorumUnavailable, op, s.spec.ID,
-			"leader cannot currently contact a majority")
+			"leader cannot currently contact a voting majority")
 	}
 	return leader, nil
 }
@@ -688,8 +890,8 @@ func (s *ReplicaSet) Write(ctx context.Context, req WriteRequest) (*WriteRespons
 
 	acks, err := s.appendAndCommitLocked(leader, entry)
 	if err != nil {
-		s.logf("shard=%s write key=%s request=%s rejected after acks=%d: %v",
-			s.spec.ID, req.Key, req.RequestID, acks, err)
+		s.logf("shard=%s write key=%s request=%s rejected after %s: %v",
+			s.spec.ID, req.Key, req.RequestID, acks.describe(), err)
 		return nil, err
 	}
 
@@ -713,15 +915,9 @@ func (s *ReplicaSet) Write(ctx context.Context, req WriteRequest) (*WriteRespons
 }
 
 func (s *ReplicaSet) prepareStrongReadLocked(op string) (*Replica, uint64, error) {
-	aliveCount := 0
-	for _, alive := range s.alive {
-		if alive {
-			aliveCount++
-		}
-	}
-	if aliveCount < s.quorumLocked() {
+	if len(s.aliveVotersLocked()) < s.quorumLocked() {
 		return nil, 0, newError(KindQuorumUnavailable, op, s.spec.ID,
-			"alive replicas below majority for a strong read")
+			"alive voting replicas below majority for a strong read")
 	}
 	if s.leaderID == "" || !s.alive[s.leaderID] {
 		if _, err := s.electLeaderLocked(""); err != nil {
@@ -729,12 +925,12 @@ func (s *ReplicaSet) prepareStrongReadLocked(op string) (*Replica, uint64, error
 		}
 	}
 	leader := s.replicas[s.leaderID]
-	reachable := s.reachableFromLocked(leader.id)
+	reachable := s.reachableMembersLocked(leader.id, s.voters)
 	if len(reachable) < s.quorumLocked() {
 		return nil, 0, newError(KindStrongReadUnsafe, op, s.spec.ID,
-			"leader cannot contact a read quorum")
+			"leader cannot contact a voting read quorum")
 	}
-	maxTerm := s.maxTermAmongLocked(reachable)
+	maxTerm := s.maxTermAmongLocked(s.reachableFromLocked(leader.id))
 	if maxTerm > leader.currentTerm {
 		s.invalidateStaleLeaderLocked(op)
 		return nil, 0, newError(KindNotLeader, op, s.spec.ID,
@@ -957,6 +1153,8 @@ func (s *ReplicaSet) Status() map[string]ReplicaStatus {
 	for _, id := range s.order {
 		status := s.replicas[id].Status()
 		status.Alive = s.alive[id]
+		status.Voter = s.isVoterLocked(id)
+		status.Learner = containsID(s.learners, id)
 		out[id] = status
 	}
 	return out

@@ -70,7 +70,8 @@ type ReadResponse struct {
 	Stale       bool
 }
 
-// Entry is one replicated log entry.
+// Entry is one replicated log entry. Most entries carry a user write; admin
+// entries carry no-op leadership markers or membership changes.
 type Entry struct {
 	Index          uint64
 	Term           uint64
@@ -79,6 +80,12 @@ type Entry struct {
 	Value          []byte
 	CompareVersion *uint64
 	Admin          bool
+	// ConfigChange is empty for data and no-op entries. For membership
+	// changes it is "joint" (old+new majorities both required) or "new"
+	// (the listed voters become the sole configuration).
+	ConfigChange string
+	OldVoters    []string
+	NewVoters    []string
 }
 
 // ReplicaStatus is a test and diagnostics snapshot.
@@ -87,6 +94,8 @@ type ReplicaStatus struct {
 	ShardID     string
 	State       ReplicaState
 	Alive       bool
+	Voter       bool
+	Learner     bool
 	CurrentTerm uint64
 	CommitIndex uint64
 	LogLength   uint64

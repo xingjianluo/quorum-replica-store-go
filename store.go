@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"strings"
+	"time"
 )
 
 // Store routes key requests to the owning shard.
@@ -11,6 +12,11 @@ type Store struct {
 	specs []ShardSpec
 	sets  map[string]*ReplicaSet
 	order []string
+
+	persister *persistence
+	tick      time.Duration
+	running   bool
+	stopCh    chan struct{}
 }
 
 // NewStore constructs and validates a range-sharded store.
@@ -154,4 +160,16 @@ func (s *Store) CatchUp() error {
 		}
 	}
 	return nil
+}
+
+// ExpandReplicas grows one shard's replica count online without interrupting
+// in-flight reads and writes. Existing committed state is copied to the new
+// replicas before they become voters, and the new quorum takes effect only
+// after a joint old+new majority commit.
+func (s *Store) ExpandReplicas(shardID string, replicaIDs []string) error {
+	set, err := s.Shard(shardID)
+	if err != nil {
+		return err
+	}
+	return set.ExpandReplicas(replicaIDs)
 }
